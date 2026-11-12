@@ -648,12 +648,13 @@ static bool text_ksm_scan_find_next_mapping(void)
 			if (atomic_read(&inode->i_mapping->i_mmap_writable))
 				continue;
 			/*
-			 * i_writecount == 0: no process has the file open for
-			 * writing. (A later patch relaxes this to <= 0 to also
-			 * cover the execve deny_write_access case, where the
-			 * kernel has locked the file read-only.)
+			 * i_writecount is signed: > 0 means a process has the
+			 * file open for writing (not mergeable); < 0 means the
+			 * kernel has denied write access (execve's
+			 * deny_write_access), which is the *safest* case — the
+			 * file is locked read-only. So allow <= 0.
 			 */
-			if (atomic_read(&inode->i_writecount))
+			if (atomic_read(&inode->i_writecount) > 0)
 				continue;
 
 			/* upper bound: pages in this eligible VMA */
