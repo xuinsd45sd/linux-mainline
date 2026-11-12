@@ -12,11 +12,12 @@
  *     mm to text_ksm's own mm list (independent of KSM's ksm_mm_head);
  *   - the ktextksmd thread walks the page cache of every eligible file VMA
  *     (file-backed, PROT_EXEC, currently read-only, inode passing the
- *     read-only predicate) of the opted-in mms and counts the resident
- *     single-page folios.
+ *     read-only predicate) of the opted-in mms, content-matching the resident
+ *     single-page folios against a content-keyed stable tree.
  *
- * This is detection only: no pages are merged yet. The counters let us
- * cross-check the in-kernel view against the userspace ksm-survey tool.
+ * This is detection and content matching only: no pages are merged yet. The
+ * counters let us cross-check the in-kernel view against the userspace
+ * ksm-survey tool.
  *
  * The sysfs interface lives under /sys/kernel/mm/text_ksm/ (independent of
  * /sys/kernel/mm/ksm/), and the scan thread is ktextksmd (independent of
@@ -97,6 +98,25 @@ struct text_ksm_seen_inode {
 };
 static LIST_HEAD(text_ksm_seen_inodes);
 
+/*
+ * struct text_ksm_stable_node - node of the content-keyed stable tree.
+ *
+ * Independent from the anonymous KSM stable tree (type isolation: file pages
+ * only merge with file pages). Like the anon stable tree it is content-keyed:
+ * nodes are ordered by page content (memcmp_pages), so a search finds a page
+ * with identical content.
+ *
+ * Each node holds a reference on its survivor's folio (via the page pointer),
+ * so the survivor is always valid for comparison — no keyhole check is needed
+ * in this measurement pass. (A later patch switches to a ref-free,
+ * identity-based keyhole so that a merged page can remain evictable.)
+ */
+struct text_ksm_stable_node {
+	struct rb_node node;
+	struct page *page;		/* survivor page; ref on page_folio(page) */
+};
+static struct rb_root root_text_ksm_stable_tree = RB_ROOT;
+
 #define TEXT_KSM_MM_SLOTS_HASH_BITS 10
 static DEFINE_HASHTABLE(text_ksm_mm_slots_hash, TEXT_KSM_MM_SLOTS_HASH_BITS);
 
@@ -147,17 +167,127 @@ static bool text_ksm_scan_active;
  *                 non-resident).
  * pages_resident: of the eligible mappings, pages actually resident in the
  *                 page cache (single-page folios, THP skipped).
+ * pages_mergeable: of the resident pages, those with an identical
+ *                 counterpart already seen this scan (i.e. actually
+ *                 mergeable by content).
  */
 static unsigned long text_ksm_pages_total;
 static unsigned long text_ksm_pages_resident;
+static unsigned long text_ksm_pages_mergeable;
 
 /* Private accumulators for the in-progress scan (see above). */
 static unsigned long text_ksm_total_acc;
 static unsigned long text_ksm_resident_acc;
+static unsigned long text_ksm_mergeable_acc;
 
 static DECLARE_WAIT_QUEUE_HEAD(text_ksm_thread_wait);
 static DECLARE_WAIT_QUEUE_HEAD(text_ksm_iter_wait);
 static DEFINE_MUTEX(text_ksm_thread_mutex);
+
+/*
+ * text_ksm_stable_tree_search - search the stable tree for a page with
+ * identical content to @page.
+ *
+ * Content-keyed walk (memcmp_pages), like the anonymous stable tree. Returns
+ * the matching node if found, NULL otherwise. The node holds a ref on its
+ * survivor's folio, so it is always valid for comparison — no keyhole check
+ * is needed in this measurement pass.
+ */
+static struct text_ksm_stable_node *text_ksm_stable_tree_search(struct page *page)
+{
+	struct rb_node **new = &root_text_ksm_stable_tree.rb_node;
+	struct rb_node *parent = NULL;
+
+	while (*new) {
+		struct text_ksm_stable_node *node;
+		int ret;
+
+		cond_resched();
+		node = rb_entry(*new, struct text_ksm_stable_node, node);
+		ret = memcmp_pages(page, node->page);
+
+		parent = *new;
+		if (ret < 0)
+			new = &parent->rb_left;
+		else if (ret > 0)
+			new = &parent->rb_right;
+		else
+			return node;
+	}
+	return NULL;
+}
+
+/*
+ * text_ksm_stable_tree_insert - insert a node for @page into the stable tree,
+ * recording it as the survivor.
+ *
+ * Returns the new node on success, NULL if an identical page is already in
+ * the tree or on allocation failure. The node takes a reference on the
+ * survivor's folio so it stays alive for the duration of the scan.
+ */
+static struct text_ksm_stable_node *text_ksm_stable_tree_insert(struct page *page)
+{
+	struct folio *folio = page_folio(page);
+	struct text_ksm_stable_node *node;
+	struct rb_node **new = &root_text_ksm_stable_tree.rb_node;
+	struct rb_node *parent = NULL;
+
+	node = kmalloc(sizeof(*node), GFP_KERNEL);
+	if (!node)
+		return NULL;
+
+	while (*new) {
+		struct text_ksm_stable_node *t;
+		int ret;
+
+		cond_resched();
+		t = rb_entry(*new, struct text_ksm_stable_node, node);
+		ret = memcmp_pages(page, t->page);
+
+		parent = *new;
+		if (ret < 0)
+			new = &parent->rb_left;
+		else if (ret > 0)
+			new = &parent->rb_right;
+		else {
+			/* identical content already in the tree */
+			kfree(node);
+			return NULL;
+		}
+	}
+
+	/*
+	 * Record the survivor page and take a reference on its folio so it
+	 * stays alive for the duration of the scan.
+	 */
+	node->page = page;
+	folio_get(folio);
+	rb_link_node(&node->node, parent, new);
+	rb_insert_color(&node->node, &root_text_ksm_stable_tree);
+	return node;
+}
+
+/*
+ * text_ksm_stable_tree_free - free all nodes in the stable tree.
+ *
+ * Called at the end of each scan pass, so the nodes allocated by the pass are
+ * not leaked. Each node holds a reference on its survivor's folio, so drop it
+ * here.
+ */
+static void text_ksm_stable_tree_free(void)
+{
+	struct rb_node *node = rb_first(&root_text_ksm_stable_tree);
+
+	while (node) {
+		struct text_ksm_stable_node *sn =
+			rb_entry(node, struct text_ksm_stable_node, node);
+
+		node = rb_next(node);
+		rb_erase(&sn->node, &root_text_ksm_stable_tree);
+		folio_put(page_folio(sn->page));
+		kfree(sn);
+	}
+}
 
 /*
  * text_ksm_scan_inode_seen - has @inode's page cache already been walked this
@@ -372,8 +502,18 @@ static bool text_ksm_scan_next(void)
 		 * skipped. Shared libraries don't use THP, so this is a rare
 		 * skip in practice.
 		 */
-		if (!folio_test_large(folio))
+		if (!folio_test_large(folio)) {
 			text_ksm_resident_acc++;
+			/*
+			 * Content-match: if an identical page is already in
+			 * the stable tree this one is mergeable; otherwise
+			 * record it as a new survivor.
+			 */
+			if (text_ksm_stable_tree_search(&folio->page))
+				text_ksm_mergeable_acc++;
+			else
+				text_ksm_stable_tree_insert(&folio->page);
+		}
 		folio_put(folio);
 	}
 	return true;
@@ -397,6 +537,7 @@ static void text_ksm_scan_start(void)
 
 	text_ksm_total_acc = 0;
 	text_ksm_resident_acc = 0;
+	text_ksm_mergeable_acc = 0;
 
 	text_ksm_scan.mm = NULL;
 	text_ksm_scan.inode = NULL;
@@ -415,6 +556,9 @@ static void text_ksm_scan_start(void)
 static void text_ksm_scan_finish(bool publish)
 {
 	struct text_ksm_seen_inode *si, *tmp;
+
+	text_ksm_stable_tree_free();
+	root_text_ksm_stable_tree = RB_ROOT;
 
 	list_for_each_entry_safe(si, tmp, &text_ksm_seen_inodes, list) {
 		list_del(&si->list);
@@ -437,6 +581,7 @@ static void text_ksm_scan_finish(bool publish)
 		 */
 		text_ksm_pages_total = text_ksm_total_acc;
 		text_ksm_pages_resident = text_ksm_resident_acc;
+		text_ksm_pages_mergeable = text_ksm_mergeable_acc;
 	}
 
 	text_ksm_scan_active = false;
@@ -704,12 +849,20 @@ static ssize_t pages_resident_show(struct kobject *kobj,
 }
 TEXT_KSM_ATTR_RO(pages_resident);
 
+static ssize_t pages_mergeable_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", text_ksm_pages_mergeable);
+}
+TEXT_KSM_ATTR_RO(pages_mergeable);
+
 static struct attribute *text_ksm_attrs[] = {
 	&run_attr.attr,
 	&pages_to_scan_attr.attr,
 	&sleep_millisecs_attr.attr,
 	&pages_total_attr.attr,
 	&pages_resident_attr.attr,
+	&pages_mergeable_attr.attr,
 	NULL,
 };
 
