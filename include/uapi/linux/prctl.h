@@ -407,6 +407,13 @@ struct prctl_mm_map {
 #define PR_GET_CFI	80
 #define PR_SET_CFI	81
 /*
+ * Opt the current process in/out of text_ksm merging of its file-backed
+ * read-only executable pages (see mm/text_ksm.c). arg2 is 1 to enable, 0 to
+ * disable. PR_GET_TEXT_MERGE returns the current state.
+ */
+#define PR_SET_TEXT_MERGE	82
+#define PR_GET_TEXT_MERGE	83
+/*
  * Forward-edge CFI variants (excluding ARM64 BTI, which has its own
  * prctl()s).
  */

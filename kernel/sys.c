@@ -16,6 +16,7 @@
 #include <linux/fs.h>
 #include <linux/kmod.h>
 #include <linux/ksm.h>
+#include <linux/text_ksm.h>
 #include <linux/perf_event.h>
 #include <linux/resource.h>
 #include <linux/kernel.h>
@@ -2853,6 +2854,23 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EINVAL;
 
 		error = !!mm_flags_test(MMF_VM_MERGE_ANY, me->mm);
+		break;
+#endif
+#ifdef CONFIG_TEXT_KSM
+	case PR_SET_TEXT_MERGE:
+		if (arg3 || arg4 || arg5)
+			return -EINVAL;
+
+		if (arg2)
+			error = text_ksm_enable(me->mm);
+		else
+			error = text_ksm_disable(me->mm);
+		break;
+	case PR_GET_TEXT_MERGE:
+		if (arg2 || arg3 || arg4 || arg5)
+			return -EINVAL;
+
+		error = !!mm_flags_test(MMF_TEXT_MERGEABLE, me->mm);
 		break;
 #endif
 	case PR_RISCV_V_SET_CONTROL:
