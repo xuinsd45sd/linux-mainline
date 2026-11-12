@@ -445,6 +445,18 @@ static bool text_ksm_merge_one(struct folio *folio, struct vm_area_struct *vma,
 	ptep_clear_flush(vma, address, ptep);
 	set_pte_at(mm, address, ptep, newpte);
 	folio_remove_rmap_pte(folio, borrower_page, vma);
+	/*
+	 * The PTE now points at the survivor, so the eventual unmap will
+	 * decrement the survivor's rss counter type (mm_counter(survivor)).
+	 * But the fault that installed this PTE incremented the borrower's
+	 * type (mm_counter(borrower)). If the two differ (e.g. the borrower
+	 * is a tmpfs/shmem file -> MM_SHMEMPAGES, the survivor a 9p/ext4 file
+	 * -> MM_FILEPAGES), move the accounting so the counters stay balanced.
+	 */
+	if (mm_counter(folio) != mm_counter(survivor)) {
+		dec_mm_counter(mm, mm_counter(folio));
+		inc_mm_counter(mm, mm_counter(survivor));
+	}
 	fma->merged++;
 
 	pte_unmap_unlock(ptep, ptl);
