@@ -20,6 +20,7 @@
 #include <linux/hugetlb.h>
 #include <linux/kernel.h>
 #include <linux/ksm.h>
+#include <linux/text_ksm.h>
 #include <linux/khugepaged.h>
 #include <linux/list.h>
 #include <linux/maple_tree.h>

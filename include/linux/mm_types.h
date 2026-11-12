@@ -2030,6 +2030,14 @@ enum {
 #define MMF_TOPDOWN		31	/* mm searches top down by default */
 #define MMF_TOPDOWN_MASK	BIT(MMF_TOPDOWN)
 
+/*
+ * MMF_TEXT_MERGEABLE: this mm has opted in (via prctl(PR_SET_TEXT_MERGE)) to
+ * text_ksm merging of its file-backed read-only executable pages. It is a
+ * "new" flag (bit >= 32), so it is not part of MMF_INIT_LEGACY_MASK and is not
+ * auto-propagated on fork; text_ksm_fork() propagates it explicitly.
+ */
+#define MMF_TEXT_MERGEABLE	32
+
 #define MMF_INIT_LEGACY_MASK	(MMF_DUMP_FILTER_MASK |\
 				 MMF_DISABLE_THP_MASK | MMF_HAS_MDWE_MASK |\
 				 MMF_VM_MERGE_ANY_MASK | MMF_TOPDOWN_MASK)

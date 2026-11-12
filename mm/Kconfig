@@ -735,6 +735,22 @@ config KSM
 	  until a program has madvised that an area is MADV_MERGEABLE, and
 	  root has set /sys/kernel/mm/ksm/run to 1 (if CONFIG_SYSFS is set).
 
+config TEXT_KSM
+	bool "Enable text_ksm for file-backed read-only executable page merging"
+	depends on KSM
+	help
+	  Enable text_ksm, a separate subsystem from the traditional (anonymous)
+	  KSM. It merges identical *file* pages (e.g. the same shared library
+	  mapped from different paths / inodes) rather than anonymous pages. A
+	  process opts in per-mm via prctl(PR_SET_TEXT_MERGE); the ktextksmd
+	  thread then content-matches the resident single-page folios of every
+	  eligible file VMA (file-backed, PROT_EXEC, currently read-only) of the
+	  opted-in mms and merges the ones with identical content.
+
+	  The sysfs interface lives under /sys/kernel/mm/text_ksm/ (independent
+	  of /sys/kernel/mm/ksm/), and the scan thread is ktextksmd (independent
+	  of ksmd), with its own run / pages_to_scan / sleep_millisecs knobs.
+
 config DEFAULT_MMAP_MIN_ADDR
 	int "Low address space to protect from user allocation"
 	depends on MMU

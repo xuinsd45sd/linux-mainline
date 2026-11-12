@@ -47,6 +47,7 @@
 #include <linux/oom.h>
 #include <linux/sched/mm.h>
 #include <linux/ksm.h>
+#include <linux/text_ksm.h>
 #include <linux/memfd.h>
 
 #include <linux/uaccess.h>
@@ -1824,6 +1825,7 @@ loop_out:
 	if (!retval) {
 		mt_set_in_rcu(vmi.mas.tree);
 		ksm_fork(mm, oldmm);
+		text_ksm_fork(mm, oldmm);
 		khugepaged_fork(mm, oldmm);
 	} else {
 		unsigned long end;
