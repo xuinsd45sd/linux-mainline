@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * text_ksm - detection of file-backed read-only executable pages.
+ * text_ksm - merging of file-backed read-only executable pages.
  *
  * This is a separate subsystem from the traditional (anonymous) KSM in
  * ksm.c. It targets *file* pages (e.g. the same shared library mapped from
@@ -20,9 +20,10 @@
  * than by holding a reference on the survivor's folio: a merged page must
  * remain evictable, so it cannot be pinned by a ref.
  *
- * This is detection and content matching only: no pages are merged yet. The
- * counters let us cross-check the in-kernel view against the userspace
- * ksm-survey tool.
+ * When a content match is found the borrower's PTEs are redirected to the
+ * survivor (the page-cache page that was seen first), so the two mappings
+ * share one physical page. The counters let us cross-check the in-kernel
+ * view against the userspace ksm-survey tool.
  *
  * The sysfs interface lives under /sys/kernel/mm/text_ksm/ (independent of
  * /sys/kernel/mm/ksm/), and the scan thread is ktextksmd (independent of
@@ -184,15 +185,21 @@ static bool text_ksm_scan_active;
  * pages_mergeable: of the resident pages, those with an identical
  *                 counterpart already seen this scan (i.e. actually
  *                 mergeable by content).
+ * pages_merged:   of the mergeable pages, those actually merged this scan
+ *                 (their PTEs were replaced to point at the survivor). In
+ *                 the steady state (no eviction, no lock contention) this
+ *                 equals pages_mergeable.
  */
 static unsigned long text_ksm_pages_total;
 static unsigned long text_ksm_pages_resident;
 static unsigned long text_ksm_pages_mergeable;
+static unsigned long text_ksm_pages_merged;
 
 /* Private accumulators for the in-progress scan (see above). */
 static unsigned long text_ksm_total_acc;
 static unsigned long text_ksm_resident_acc;
 static unsigned long text_ksm_mergeable_acc;
+static unsigned long text_ksm_merged_acc;
 
 static DECLARE_WAIT_QUEUE_HEAD(text_ksm_thread_wait);
 static DECLARE_WAIT_QUEUE_HEAD(text_ksm_iter_wait);
@@ -371,6 +378,117 @@ static void text_ksm_stable_tree_free(void)
 		rb_erase(&sn->node, &root_text_ksm_stable_tree);
 		kfree(sn);
 	}
+}
+
+/*
+ * text_ksm_merge_one - rmap_walk callback: redirect one PTE of @folio to the
+ * survivor.
+ *
+ * @folio is the borrower (the page being merged away); the survivor and its
+ * page are carried in @arg. The PTE must currently point at @folio; if it
+ * already points at the survivor the page was merged by an earlier pass and
+ * is just counted.
+ */
+struct text_ksm_merge_arg {
+	struct folio *survivor;
+	struct page *survivor_page;
+	int merged;
+};
+
+static bool text_ksm_merge_one(struct folio *folio, struct vm_area_struct *vma,
+			       unsigned long address, void *arg)
+{
+	struct text_ksm_merge_arg *fma = arg;
+	struct folio *survivor = fma->survivor;
+	struct page *survivor_page = fma->survivor_page;
+	struct mm_struct *mm = vma->vm_mm;
+	pmd_t *pmd;
+	pte_t *ptep;
+	pte_t orig_pte;
+	pte_t newpte;
+	spinlock_t *ptl;
+	struct page *borrower_page;
+
+	pmd = mm_find_pmd(mm, address);
+	if (!pmd)
+		return true;
+	if (!pmd_present(pmdp_get_lockless(pmd)) ||
+	    pmd_trans_huge(pmdp_get_lockless(pmd)))
+		return true;
+
+	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+	if (!ptep)
+		return true;
+
+	orig_pte = ptep_get(ptep);
+	if (!pte_present(orig_pte)) {
+		pte_unmap_unlock(ptep, ptl);
+		return true;
+	}
+
+	borrower_page = pte_page(orig_pte);
+	if (page_folio(borrower_page) == survivor) {
+		/* Already merged: the PTE points at the survivor. */
+		fma->merged++;
+		pte_unmap_unlock(ptep, ptl);
+		return true;
+	}
+	if (page_folio(borrower_page) != folio) {
+		/* Points at neither the borrower nor the survivor. */
+		pte_unmap_unlock(ptep, ptl);
+		return true;
+	}
+
+	/* Merge: redirect this PTE to the survivor. */
+	newpte = mk_pte(survivor_page, vma->vm_page_prot);
+	folio_add_file_rmap_ptes(survivor, survivor_page, 1, vma);
+	ptep_clear_flush(vma, address, ptep);
+	set_pte_at(mm, address, ptep, newpte);
+	folio_remove_rmap_pte(folio, borrower_page, vma);
+	fma->merged++;
+
+	pte_unmap_unlock(ptep, ptl);
+	return true;
+}
+
+/*
+ * text_ksm_merge_pages - merge @borrower into @survivor: walk @borrower's
+ * rmap and redirect every PTE that points at it to @survivor_page.
+ *
+ * Both folios are locked for the duration so their rmaps cannot change
+ * underneath the walk. Returns the number of PTEs redirected (or already
+ * pointing at the survivor).
+ */
+static int text_ksm_merge_pages(struct folio *borrower, struct folio *survivor,
+				struct page *survivor_page)
+{
+	struct text_ksm_merge_arg fma = {
+		.survivor = survivor,
+		.survivor_page = survivor_page,
+		.merged = 0,
+	};
+	struct rmap_walk_control rwc = {
+		.arg = &fma,
+		.rmap_one = text_ksm_merge_one,
+	};
+
+	if (!folio_trylock(survivor))
+		return 0;
+	if (!folio_mapping(survivor)) {
+		/* Survivor was evicted from the page cache; abort. */
+		folio_unlock(survivor);
+		return 0;
+	}
+	if (!folio_trylock(borrower)) {
+		folio_unlock(survivor);
+		return 0;
+	}
+
+	rmap_walk(borrower, &rwc);
+
+	folio_unlock(borrower);
+	folio_unlock(survivor);
+	return fma.merged;
 }
 
 /*
@@ -587,16 +705,33 @@ static bool text_ksm_scan_next(void)
 		 * skip in practice.
 		 */
 		if (!folio_test_large(folio)) {
+			struct text_ksm_stable_node *node;
+
 			text_ksm_resident_acc++;
 			/*
 			 * Content-match: if an identical page is already in
-			 * the stable tree this one is mergeable; otherwise
-			 * record it as a new survivor.
+			 * the stable tree this one is mergeable (and is
+			 * merged into the survivor); otherwise record it as
+			 * a new survivor.
 			 */
-			if (text_ksm_stable_tree_search(&folio->page))
+			node = text_ksm_stable_tree_search(&folio->page);
+			if (node) {
+				struct folio *survivor;
+				struct page *survivor_page;
+
 				text_ksm_mergeable_acc++;
-			else
+				survivor = text_ksm_stable_node_get_folio(node);
+				if (survivor) {
+					survivor_page = folio_page(survivor,
+						node->index - survivor->index);
+					text_ksm_merged_acc +=
+						text_ksm_merge_pages(folio,
+							survivor, survivor_page);
+					folio_put(survivor);
+				}
+			} else {
 				text_ksm_stable_tree_insert(&folio->page);
+			}
 		}
 		folio_put(folio);
 	}
@@ -622,6 +757,7 @@ static void text_ksm_scan_start(void)
 	text_ksm_total_acc = 0;
 	text_ksm_resident_acc = 0;
 	text_ksm_mergeable_acc = 0;
+	text_ksm_merged_acc = 0;
 
 	text_ksm_scan.mm = NULL;
 	text_ksm_scan.inode = NULL;
@@ -666,14 +802,15 @@ static void text_ksm_scan_finish(bool publish)
 		text_ksm_pages_total = text_ksm_total_acc;
 		text_ksm_pages_resident = text_ksm_resident_acc;
 		text_ksm_pages_mergeable = text_ksm_mergeable_acc;
+		text_ksm_pages_merged = text_ksm_merged_acc;
 	}
 
 	text_ksm_scan_active = false;
 }
 
 /*
- * text_ksm_do_scan - detection scan for file-backed read-only executable
- * pages.
+ * text_ksm_do_scan - scan for file-backed read-only executable pages and
+ * merge the ones with identical content.
  *
  * Stateful and budget-limited: scans at most @scan_npages page-cache indices
  * and resumes where it left off on the next call, so ktextksmd's CPU usage
@@ -940,6 +1077,13 @@ static ssize_t pages_mergeable_show(struct kobject *kobj,
 }
 TEXT_KSM_ATTR_RO(pages_mergeable);
 
+static ssize_t pages_merged_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", text_ksm_pages_merged);
+}
+TEXT_KSM_ATTR_RO(pages_merged);
+
 static struct attribute *text_ksm_attrs[] = {
 	&run_attr.attr,
 	&pages_to_scan_attr.attr,
@@ -947,6 +1091,7 @@ static struct attribute *text_ksm_attrs[] = {
 	&pages_total_attr.attr,
 	&pages_resident_attr.attr,
 	&pages_mergeable_attr.attr,
+	&pages_merged_attr.attr,
 	NULL,
 };
 
