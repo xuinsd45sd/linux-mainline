@@ -441,10 +441,18 @@ static bool text_ksm_merge_one(struct folio *folio, struct vm_area_struct *vma,
 
 	/* Merge: redirect this PTE to the survivor. */
 	newpte = mk_pte(survivor_page, vma->vm_page_prot);
+	/*
+	 * The PTE holds one folio reference. Redirecting it from the borrower
+	 * to the survivor transfers that reference: take one on the survivor
+	 * (the PTE will now hold it) and drop one on the borrower (the PTE no
+	 * longer holds it). The caller holds a ref on both, so neither is freed.
+	 */
+	folio_get(survivor);
 	folio_add_file_rmap_ptes(survivor, survivor_page, 1, vma);
 	ptep_clear_flush(vma, address, ptep);
 	set_pte_at(mm, address, ptep, newpte);
 	folio_remove_rmap_pte(folio, borrower_page, vma);
+	folio_put(folio);
 	/*
 	 * The PTE now points at the survivor, so the eventual unmap will
 	 * decrement the survivor's rss counter type (mm_counter(survivor)).
