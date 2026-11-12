@@ -15,6 +15,11 @@
  *     read-only predicate) of the opted-in mms, content-matching the resident
  *     single-page folios against a content-keyed stable tree.
  *
+ * The stable tree records each survivor by its page-cache identity
+ * (mapping, index), re-verified through a keyhole (filemap_get_entry), rather
+ * than by holding a reference on the survivor's folio: a merged page must
+ * remain evictable, so it cannot be pinned by a ref.
+ *
  * This is detection and content matching only: no pages are merged yet. The
  * counters let us cross-check the in-kernel view against the userspace
  * ksm-survey tool.
@@ -106,14 +111,23 @@ static LIST_HEAD(text_ksm_seen_inodes);
  * nodes are ordered by page content (memcmp_pages), so a search finds a page
  * with identical content.
  *
- * Each node holds a reference on its survivor's folio (via the page pointer),
- * so the survivor is always valid for comparison — no keyhole check is needed
- * in this measurement pass. (A later patch switches to a ref-free,
- * identity-based keyhole so that a merged page can remain evictable.)
+ * Each node records the "survivor" page by its page-cache identity
+ * (mapping, index), not by holding a reference on the survivor's folio. A
+ * merged page must remain evictable (it is a clean file page in the page
+ * cache), so it cannot be pinned by a ref; instead the node "peeks" at the
+ * survivor through a keyhole: text_ksm_stable_node_get_folio() re-verifies
+ * the identity via the page cache xarray (filemap_get_entry) each time the
+ * node is consulted, and judges the node stale if the folio is no longer
+ * there.
+ *
+ * The content at (mapping, index) is always the file's content at that
+ * offset, so even if the original survivor folio was evicted and re-read,
+ * the re-read folio has identical content and is valid for comparison.
  */
 struct text_ksm_stable_node {
 	struct rb_node node;
-	struct page *page;		/* survivor page; ref on page_folio(page) */
+	struct address_space *mapping;	/* survivor's page-cache mapping */
+	pgoff_t index;			/* survivor's page-cache index */
 };
 static struct rb_root root_text_ksm_stable_tree = RB_ROOT;
 
@@ -185,26 +199,78 @@ static DECLARE_WAIT_QUEUE_HEAD(text_ksm_iter_wait);
 static DEFINE_MUTEX(text_ksm_thread_mutex);
 
 /*
+ * text_ksm_stable_node_get_folio - keyhole: get the survivor folio recorded
+ * by @node, or NULL if it is no longer a page-cache entry.
+ *
+ * The node stores the survivor's page-cache identity (mapping, index), not a
+ * reference on the folio (a merged page must remain evictable, so it cannot
+ * be pinned by a ref). filemap_get_entry() re-verifies the identity: it
+ * returns the folio with a raised refcount if it is still a page-cache entry,
+ * or a shadow/swap value (or NULL) if it has been evicted. The caller must
+ * folio_put() a returned folio. Because filemap_get_entry() only ever returns
+ * a folio it holds a reference to (or a value/NULL), this can never hand out
+ * a dangling pointer — the keyhole is safe by construction.
+ */
+static struct folio *text_ksm_stable_node_get_folio(struct text_ksm_stable_node *node)
+{
+	struct address_space *mapping;
+	pgoff_t index;
+	void *entry;
+
+	/* Address dependency: read the identity before the xarray lookup. */
+	mapping = READ_ONCE(node->mapping);
+	index = READ_ONCE(node->index);
+	entry = filemap_get_entry(mapping, index);
+	if (!entry || xa_is_value(entry))
+		return NULL;
+	return (struct folio *)entry;
+}
+
+/*
  * text_ksm_stable_tree_search - search the stable tree for a page with
  * identical content to @page.
  *
- * Content-keyed walk (memcmp_pages), like the anonymous stable tree. Returns
- * the matching node if found, NULL otherwise. The node holds a ref on its
- * survivor's folio, so it is always valid for comparison — no keyhole check
- * is needed in this measurement pass.
+ * Content-keyed walk (memcmp_pages). Returns the matching node if found, NULL
+ * otherwise. Each node's survivor is fetched through the keyhole; a stale
+ * node (survivor evicted from the page cache) is pruned and the walk
+ * restarted.
  */
 static struct text_ksm_stable_node *text_ksm_stable_tree_search(struct page *page)
 {
-	struct rb_node **new = &root_text_ksm_stable_tree.rb_node;
-	struct rb_node *parent = NULL;
+	struct rb_node **new;
+	struct rb_node *parent;
 
+again:
+	new = &root_text_ksm_stable_tree.rb_node;
+	parent = NULL;
 	while (*new) {
 		struct text_ksm_stable_node *node;
+		struct folio *tree_folio;
 		int ret;
 
 		cond_resched();
 		node = rb_entry(*new, struct text_ksm_stable_node, node);
-		ret = memcmp_pages(page, node->page);
+		tree_folio = text_ksm_stable_node_get_folio(node);
+		if (!tree_folio) {
+			/*
+			 * The survivor was evicted from the page cache: the
+			 * node is stale. Remove it (this may rebalance the
+			 * tree from under us) and restart the search from
+			 * scratch.
+			 */
+			rb_erase(&node->node, &root_text_ksm_stable_tree);
+			kfree(node);
+			goto again;
+		}
+		/*
+		 * Compare against the page at the survivor's index, not the
+		 * folio's first page: the page cache may hold a large folio
+		 * covering node->index (file THP), in which case folio->page
+		 * is the wrong page.
+		 */
+		ret = memcmp_pages(page,
+			folio_page(tree_folio, node->index - tree_folio->index));
+		folio_put(tree_folio);
 
 		parent = *new;
 		if (ret < 0)
@@ -218,31 +284,48 @@ static struct text_ksm_stable_node *text_ksm_stable_tree_search(struct page *pag
 }
 
 /*
- * text_ksm_stable_tree_insert - insert a node for @page into the stable tree,
- * recording it as the survivor.
+ * text_ksm_stable_tree_insert - insert a node for @page into the stable
+ * tree, recording it as the survivor by its page-cache identity.
  *
  * Returns the new node on success, NULL if an identical page is already in
- * the tree or on allocation failure. The node takes a reference on the
- * survivor's folio so it stays alive for the duration of the scan.
+ * the tree or on allocation failure. The comparison walk uses the keyhole and
+ * prunes stale nodes, like text_ksm_stable_tree_search().
  */
 static struct text_ksm_stable_node *text_ksm_stable_tree_insert(struct page *page)
 {
 	struct folio *folio = page_folio(page);
 	struct text_ksm_stable_node *node;
-	struct rb_node **new = &root_text_ksm_stable_tree.rb_node;
-	struct rb_node *parent = NULL;
+	struct rb_node **new;
+	struct rb_node *parent;
 
 	node = kmalloc(sizeof(*node), GFP_KERNEL);
 	if (!node)
 		return NULL;
 
+again:
+	new = &root_text_ksm_stable_tree.rb_node;
+	parent = NULL;
 	while (*new) {
 		struct text_ksm_stable_node *t;
+		struct folio *tree_folio;
 		int ret;
 
 		cond_resched();
 		t = rb_entry(*new, struct text_ksm_stable_node, node);
-		ret = memcmp_pages(page, t->page);
+		tree_folio = text_ksm_stable_node_get_folio(t);
+		if (!tree_folio) {
+			rb_erase(&t->node, &root_text_ksm_stable_tree);
+			kfree(t);
+			goto again;
+		}
+		/*
+		 * Compare against the page at the survivor's index, not the
+		 * folio's first page (the page cache may hold a large folio
+		 * covering t->index).
+		 */
+		ret = memcmp_pages(page,
+			folio_page(tree_folio, t->index - tree_folio->index));
+		folio_put(tree_folio);
 
 		parent = *new;
 		if (ret < 0)
@@ -257,11 +340,13 @@ static struct text_ksm_stable_node *text_ksm_stable_tree_insert(struct page *pag
 	}
 
 	/*
-	 * Record the survivor page and take a reference on its folio so it
-	 * stays alive for the duration of the scan.
+	 * Record the survivor's page-cache identity (mapping, index), not a
+	 * reference: a merged page must remain evictable, so it cannot be
+	 * pinned by a ref. The keyhole re-verifies the identity via the page
+	 * cache xarray each time the node is used.
 	 */
-	node->page = page;
-	folio_get(folio);
+	node->mapping = folio->mapping;
+	node->index = folio->index;
 	rb_link_node(&node->node, parent, new);
 	rb_insert_color(&node->node, &root_text_ksm_stable_tree);
 	return node;
@@ -271,8 +356,8 @@ static struct text_ksm_stable_node *text_ksm_stable_tree_insert(struct page *pag
  * text_ksm_stable_tree_free - free all nodes in the stable tree.
  *
  * Called at the end of each scan pass, so the nodes allocated by the pass are
- * not leaked. Each node holds a reference on its survivor's folio, so drop it
- * here.
+ * not leaked. The nodes hold no reference on their survivor's folio (the
+ * keyhole is ref-free), so there is nothing to put here.
  */
 static void text_ksm_stable_tree_free(void)
 {
@@ -284,7 +369,6 @@ static void text_ksm_stable_tree_free(void)
 
 		node = rb_next(node);
 		rb_erase(&sn->node, &root_text_ksm_stable_tree);
-		folio_put(page_folio(sn->page));
 		kfree(sn);
 	}
 }
