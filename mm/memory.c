@@ -1160,6 +1160,14 @@ static __always_inline void __copy_present_ptes(struct vm_area_struct *dst_vma,
 		pte = pte_mkclean(pte);
 	pte = pte_mkold(pte);
 
+	/*
+	 * Clear the dirty-bit marker on KSM-placed zero-page PTEs in the
+	 * child so inherited mappings are not accounted against the child or
+	 * unshared by MADV_UNMERGEABLE.  Special PTEs always have nr == 1.
+	 */
+	if (is_ksm_zero_pte(pte))
+		pte = pte_mkclean(pte);
+
 	set_ptes(dst_vma->vm_mm, addr, dst_pte, pte, nr);
 }
 
