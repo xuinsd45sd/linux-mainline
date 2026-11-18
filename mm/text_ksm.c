@@ -177,6 +177,12 @@ static bool text_ksm_scan_active;
  * (text_ksm_scan_finish). This keeps them stable — a reader never sees a
  * half-finished scan, even though the scan restarts every cycle.
  *
+ * Because they are republished from scratch on every completed scan, they do
+ * come down as pages are evicted or mms opt out — but only while scanning is
+ * in progress. When the last opted-in mm leaves the list there is nothing
+ * left to scan, so __text_ksm_exit() resets them to zero explicitly; without
+ * that they would stay pinned at the last scan's values forever.
+ *
  * pages_total:    upper bound — total pages in eligible file-backed
  *                 PROT_EXEC read-only VMAs (whole VMA ranges, incl.
  *                 non-resident).
@@ -200,6 +206,22 @@ static unsigned long text_ksm_total_acc;
 static unsigned long text_ksm_resident_acc;
 static unsigned long text_ksm_mergeable_acc;
 static unsigned long text_ksm_merged_acc;
+
+/*
+ * text_ksm_counters_reset - zero the published counters.
+ *
+ * Used when the last opted-in mm leaves the list: every text_ksm merge exists
+ * only as a PTE of an mm on that list, and that PTE is unmapped when the mm
+ * exits, so with no mm left nothing is merged any more and the counters must
+ * read 0 instead of staying pinned at the last scan's values.
+ */
+static void text_ksm_counters_reset(void)
+{
+	text_ksm_pages_total = 0;
+	text_ksm_pages_resident = 0;
+	text_ksm_pages_mergeable = 0;
+	text_ksm_pages_merged = 0;
+}
 
 static DECLARE_WAIT_QUEUE_HEAD(text_ksm_thread_wait);
 static DECLARE_WAIT_QUEUE_HEAD(text_ksm_iter_wait);
@@ -819,11 +841,24 @@ static void text_ksm_scan_finish(bool publish)
 		 * Publish the completed scan's result to the sysfs counters.
 		 * Done here (not live) so the counters always reflect a full
 		 * scan and stay stable across the scan's per-cycle restarts.
+		 *
+		 * Skip the publish if the last mm was opted out while this
+		 * scan was in flight: the scan then outlived the mm list, and
+		 * its stale totals must not overwrite the counters that
+		 * __text_ksm_exit() already reset to zero. The empty check and
+		 * the store are done under text_ksm_mmlist_lock, atomically
+		 * with respect to __text_ksm_exit() removing the last mm and
+		 * resetting, so a scan that outlives the mm list cannot
+		 * resurrect stale values.
 		 */
-		text_ksm_pages_total = text_ksm_total_acc;
-		text_ksm_pages_resident = text_ksm_resident_acc;
-		text_ksm_pages_mergeable = text_ksm_mergeable_acc;
-		text_ksm_pages_merged = text_ksm_merged_acc;
+		spin_lock(&text_ksm_mmlist_lock);
+		if (!list_empty(&text_ksm_mm_head.slot.mm_node)) {
+			text_ksm_pages_total = text_ksm_total_acc;
+			text_ksm_pages_resident = text_ksm_resident_acc;
+			text_ksm_pages_mergeable = text_ksm_mergeable_acc;
+			text_ksm_pages_merged = text_ksm_merged_acc;
+		}
+		spin_unlock(&text_ksm_mmlist_lock);
 	}
 
 	text_ksm_scan_active = false;
@@ -953,6 +988,17 @@ void __text_ksm_exit(struct mm_struct *mm)
 	if (slot) {
 		mm_slot = mm_slot_entry(slot, struct text_ksm_mm_slot, slot);
 		mm_slot_remove(slot);
+		/*
+		 * If this was the last opted-in mm, no text_ksm merge can
+		 * remain: merged PTEs only ever belong to mms on the list and
+		 * are unmapped when those mms exit. Reset the counters so they
+		 * come down to zero instead of staying pinned at the last
+		 * completed scan's values. Done under text_ksm_mmlist_lock,
+		 * atomically with respect to the scan's publish, so a scan
+		 * that outlives the mm list cannot resurrect stale values.
+		 */
+		if (list_empty(&text_ksm_mm_head.slot.mm_node))
+			text_ksm_counters_reset();
 	}
 	spin_unlock(&text_ksm_mmlist_lock);
 
